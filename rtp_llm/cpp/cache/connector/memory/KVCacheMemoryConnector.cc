@@ -466,10 +466,19 @@ bool KVCacheMemoryConnector::startCopyAsync(const std::shared_ptr<MemoryAsyncCon
     if (stop_.load()) {
         return false;
     }
-    auto code = wait_done_thread_pool_->pushTask([this, context, copy_plan]() mutable {
+    const char* dir_str = copy_plan->direction == CopyDirection::H2D ? "H2D" : "D2H";
+    const size_t copy_infos_size = copy_plan->copy_infos.size();
+    auto code = wait_done_thread_pool_->pushTask([this, context, copy_plan, dir_str, copy_infos_size]() mutable {
+        RTP_LLM_LOG_INFO("LXQ|startCopyAsync: sending broadcast, direction=%s, copy_keys=%zu", dir_str, copy_infos_size);
+        autil::ScopedTime2 bcast_timer;
         auto send_result = sendCopyPlan(copy_plan);
+        RTP_LLM_LOG_INFO("LXQ|startCopyAsync: broadcast sent, direction=%s, copy_keys=%zu, send_us=%ld, waiting for done",
+                          dir_str, copy_infos_size, bcast_timer.done_us());
         context->setBroadcastResult(send_result);
+        autil::ScopedTime2 wait_timer;
         context->waitDone();
+        RTP_LLM_LOG_INFO("LXQ|startCopyAsync: all done, direction=%s, copy_keys=%zu, wait_us=%ld",
+                          dir_str, copy_infos_size, wait_timer.done_us());
     });
     if (code != autil::ThreadPoolBase::ERROR_NONE) {
         RTP_LLM_LOG_WARNING("start copy plan async failed, push send+wait task failed, code=%d", code);
@@ -530,32 +539,51 @@ bool KVCacheMemoryConnector::copyCache(const MemoryOperationRequestPB& request, 
     autil::ScopedTime2 timer;
     const auto         copy_direction =
         (request.copy_direction() == MemoryOperationRequestPB::H2D) ? CopyDirection::H2D : CopyDirection::D2H;
+    const char* dir_str = copy_direction == CopyDirection::H2D ? "H2D" : "D2H";
+
+    RTP_LLM_LOG_INFO("LXQ|copyCache enter: direction=%s, copy_items=%d, thread=%lu",
+                      dir_str, request.copy_items_size(), pthread_self());
 
     std::vector<torch::Tensor> dst_buffers;
     std::vector<torch::Tensor> src_buffers;
+    size_t total_bytes = 0;
     for (int i = 0; i < request.copy_items_size(); ++i) {
         const auto&                     item      = request.copy_items(i);
         const auto                      mem_block = static_cast<BlockIdxType>(item.mem_block());
         const std::vector<BlockIdxType> gpu_blocks(item.gpu_blocks().begin(), item.gpu_blocks().end());
 
+        const size_t buf_count_before = dst_buffers.size();
         if (!prepareCopyBuffers(mem_block, gpu_blocks, copy_direction, dst_buffers, src_buffers)) {
             RTP_LLM_LOG_WARNING("copy cache failed, prepare copy buffers failed, mem_block=%d, direction=%s",
                                 mem_block,
-                                copy_direction == CopyDirection::H2D ? "H2D" : "D2H");
+                                dir_str);
             response.set_success(false);
             reportCopyMetrics(false, timer.done_us(), copy_direction);
             return false;
         }
+        for (size_t j = buf_count_before; j < dst_buffers.size(); ++j) {
+            total_bytes += src_buffers[j].nbytes();
+        }
+        RTP_LLM_LOG_INFO("LXQ|copyCache item[%d]: mem_block=%d, gpu_layers=%zu, new_buffers=%zu",
+                          i, mem_block, gpu_blocks.size(), dst_buffers.size() - buf_count_before);
     }
 
     if (!dst_buffers.empty()) {
+        RTP_LLM_LOG_INFO("LXQ|copyCache exec: direction=%s, buffer_pairs=%zu, total_bytes=%zu, thread=%lu",
+                          dir_str, dst_buffers.size(), total_bytes, pthread_self());
+        autil::ScopedTime2 copy_timer;
         MultiCopyParams mc{dst_buffers, src_buffers};
         applySplitKvMultiCopyFieldsIfEligible(kv_cache_config_.enable_memory_cache_sm_copy, cache_config_, mc);
         execNoBlockCopy(mc);
+        RTP_LLM_LOG_INFO("LXQ|copyCache exec done: direction=%s, buffer_pairs=%zu, total_bytes=%zu, elapsed_us=%ld, thread=%lu",
+                          dir_str, dst_buffers.size(), total_bytes, copy_timer.done_us(), pthread_self());
     }
 
     response.set_success(true);
-    reportCopyMetrics(true, timer.done_us(), copy_direction);
+    const auto total_us = timer.done_us();
+    RTP_LLM_LOG_INFO("LXQ|copyCache done: direction=%s, copy_items=%d, buffer_pairs=%zu, total_bytes=%zu, elapsed_us=%ld, thread=%lu",
+                      dir_str, request.copy_items_size(), dst_buffers.size(), total_bytes, total_us, pthread_self());
+    reportCopyMetrics(true, total_us, copy_direction);
     return true;
 }
 
