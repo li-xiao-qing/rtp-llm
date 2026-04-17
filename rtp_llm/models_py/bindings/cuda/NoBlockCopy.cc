@@ -1,10 +1,13 @@
 #include "rtp_llm/models_py/bindings/NoBlockCopy.h"
 #include "rtp_llm/models_py/bindings/cuda/SplitKvCacheCopy.h"
 #include "rtp_llm/cpp/cuda/cuda_host_utils.h"
+#include "rtp_llm/cpp/utils/Logger.h"
 
 #include <cuda_runtime.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <chrono>
+#include <thread>
 
 namespace rtp_llm {
 
@@ -50,14 +53,53 @@ void execNoBlockCopy(const MultiCopyParams& params) {
         }
     }
 
+    size_t total_bytes = 0;
     for (size_t i = 0; i < params.multi_src.size(); ++i) {
-        check_cuda_value(cudaMemcpyAsync(params.multi_dst[i].data_ptr(),
-                                         params.multi_src[i].data_ptr(),
-                                         params.multi_src[i].nbytes(),
-                                         cudaMemcpyDefault,
-                                         stream));
+        total_bytes += params.multi_src[i].nbytes();
     }
-    check_cuda_value(cudaStreamSynchronize(stream));
+
+    RTP_LLM_LOG_INFO("[NoBlockCopy] begin: device=%d, num_tensors=%zu, total_bytes=%zu, stream=%p",
+                     copy_device, params.multi_src.size(), total_bytes, (void*)stream);
+
+    for (size_t i = 0; i < params.multi_src.size(); ++i) {
+        auto ret = cudaMemcpyAsync(params.multi_dst[i].data_ptr(),
+                                   params.multi_src[i].data_ptr(),
+                                   params.multi_src[i].nbytes(),
+                                   cudaMemcpyDefault,
+                                   stream);
+        if (ret != cudaSuccess) {
+            RTP_LLM_LOG_WARNING("[NoBlockCopy] cudaMemcpyAsync[%zu] FAILED: %s", i, cudaGetErrorString(ret));
+            check_cuda_value(ret);
+        }
+    }
+
+    RTP_LLM_LOG_INFO("[NoBlockCopy] all cudaMemcpyAsync submitted, starting cudaStreamSynchronize");
+
+    auto t0 = std::chrono::steady_clock::now();
+    constexpr int kPollIntervalMs = 5000;
+    int poll_count = 0;
+    while (true) {
+        auto query_ret = cudaStreamQuery(stream);
+        if (query_ret == cudaSuccess) {
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            RTP_LLM_LOG_INFO("[NoBlockCopy] stream done after %lld ms (poll_count=%d)", (long long)elapsed_ms, poll_count);
+            break;
+        }
+        if (query_ret != cudaErrorNotReady) {
+            RTP_LLM_LOG_WARNING("[NoBlockCopy] cudaStreamQuery returned error: %s", cudaGetErrorString(query_ret));
+            check_cuda_value(query_ret);
+            break;
+        }
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        if (elapsed_ms > (poll_count + 1) * kPollIntervalMs) {
+            poll_count++;
+            RTP_LLM_LOG_WARNING("[NoBlockCopy] STILL WAITING: device=%d, elapsed=%lld ms, stream=%p, total_bytes=%zu",
+                                copy_device, (long long)elapsed_ms, (void*)stream, total_bytes);
+        }
+        std::this_thread::yield();
+    }
     check_cuda_error();
 }
 
