@@ -3,6 +3,8 @@
 #include "rtp_llm/cpp/cache/connector/Meta.h"
 #include "rtp_llm/cpp/cache/KVCacheResource.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
+#include "rtp_llm/cpp/utils/Logger.h"
+#include <chrono>
 
 namespace rtp_llm {
 
@@ -47,8 +49,29 @@ FusedAsyncReadContext::FusedAsyncReadContext(const std::shared_ptr<FusedAsyncCon
 
 void FusedAsyncReadContext::waitDone() {
     RTP_LLM_PROFILE_FUNCTION();
+    const auto  trace_id = meta_ ? meta_->trace_id() : std::string("N/A");
+    const auto  t0       = std::chrono::steady_clock::now();
+    int         warn_count = 0;
     std::unique_lock<std::mutex> lock(done_mutex_);
-    done_cv_.wait(lock, [&] { return done(); });
+    while (!done()) {
+        if (done_cv_.wait_for(lock, std::chrono::seconds(10)) == std::cv_status::timeout) {
+            ++warn_count;
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            bool match_done = fused_match_context_ ? fused_match_context_->done() : true;
+            bool match_ok   = fused_match_context_ ? fused_match_context_->success() : true;
+            bool read_set   = read_ctx_set_.load();
+            bool read_done  = false;
+            {
+                std::lock_guard<std::mutex> lk(read_ctx_mutex_);
+                read_done = !fused_read_context_ || fused_read_context_->done();
+            }
+            RTP_LLM_LOG_WARNING("[FusedAsyncReadContext::waitDone] WAITING trace_id=%s elapsed=%lld ms "
+                                "match_done=%d match_ok=%d read_ctx_set=%d read_done=%d",
+                                trace_id.c_str(), (long long)elapsed_ms,
+                                match_done, match_ok, read_set, read_done);
+        }
+    }
 }
 
 void FusedAsyncReadContext::notifyDone() {

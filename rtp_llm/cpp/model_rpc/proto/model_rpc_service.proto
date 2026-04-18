@@ -449,6 +449,7 @@ message MemoryOperationRequestPB {
     }
     repeated CopyItem copy_items = 1;
     CopyDirection copy_direction = 2;
+    string trace_id = 3;
 }
 
 message MemoryOperationResponsePB {

@@ -168,7 +168,15 @@ bool FIFOScheduler::evaluateNewStream(const list<GenerateStreamPtr>& streams,
         return false;
     }
 
+    RTP_LLM_LOG_INFO("[schedule] initKVBlock BEGIN stream_id=%ld trace_id=%s input_len=%d",
+                     new_stream->streamId(), new_stream->traceId().c_str(), new_stream->inputLength());
+    auto t0     = std::chrono::steady_clock::now();
     auto result = new_stream->initKVBlock(reserve_step);
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    RTP_LLM_LOG_INFO("[schedule] initKVBlock END stream_id=%ld trace_id=%s ok=%d took %lld ms",
+                     new_stream->streamId(), new_stream->traceId().c_str(),
+                     (int)result.ok(), (long long)elapsed_ms);
     return result.ok();
 }
 

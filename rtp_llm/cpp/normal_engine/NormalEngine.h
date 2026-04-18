@@ -85,6 +85,7 @@ private:
     std::unique_ptr<ProposeModelEngineInitParams> propose_params_;
     StepWindowProfiler                            step_profiler_;
     int                                           reserve_step_ = 0;
+    std::atomic<uint64_t>                         step_count_{0};
 };
 
 }  // namespace rtp_llm

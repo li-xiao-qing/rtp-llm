@@ -425,9 +425,10 @@ NormalEngine::batchEnqueue(const std::vector<std::shared_ptr<GenerateInput>>& in
 absl::Status NormalEngine::step() {
     RTP_LLM_PROFILE_SCOPE("engine.normal.step_work");
     while (pause_) {
-        // wait 50ms if system paused.
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+
+    const uint64_t cur_step = step_count_.fetch_add(1);
 
     list<GenerateStreamPtr> streams;
     if (parallelism_config.tp_rank == 0 && !ffn_disaggregate_config.is_ffn_service()) {
@@ -439,15 +440,15 @@ absl::Status NormalEngine::step() {
             RTP_LLM_PROFILE_SCOPE("engine.normal.may_add_fake_stream_work");
             mayAddFakeStream(streams);
         }
-        // When TP > 1, all ranks must enter process() together so that
-        // tpSyncModelInputs (collective broadcast) does not deadlock.
-        // The skip_run flag inside process() handles the "no work" case.
         if (streams.empty() && parallelism_config.tp_size <= 1) {
             return absl::OkStatus();
         }
+        if (!streams.empty() || parallelism_config.tp_size > 1) {
+            RTP_LLM_LOG_INFO("[engine.step] step=%lu rank=0 scheduled_streams=%zu tp=%d",
+                             (unsigned long)cur_step, streams.size(), parallelism_config.tp_size);
+        }
     }
 
-    RTP_LLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     int64_t      step_begin_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
     absl::Status status             = absl::OkStatus();
     {
@@ -455,16 +456,19 @@ absl::Status NormalEngine::step() {
         status = executor_->process(streams);
     }
 
-    // tick profiler after process() so that all TP ranks (which synchronize
-    // inside process() via NCCL) start/stop the profiler at the same point,
-    // giving aligned time windows across ranks.
+    auto step_end_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+    auto step_latency_us  = step_end_time_us - step_begin_time_us;
+    if (step_latency_us > 5000000) {
+        RTP_LLM_LOG_WARNING("[engine.step] step=%lu SLOW took %ld us, rank=%d streams=%zu",
+                            (unsigned long)cur_step, step_latency_us,
+                            parallelism_config.tp_rank, streams.size());
+    }
+
     step_profiler_.tick();
 
-    // report step metrics
     if (parallelism_config.tp_rank == 0) {
         RTP_LLM_PROFILE_SCOPE("engine.normal.report_metrics_work");
-        auto step_latency = autil::TimeUtility::currentTimeInMicroSeconds() - step_begin_time_us;
-        reportMetrics({step_latency});
+        reportMetrics({step_latency_us});
     }
 
     return status;

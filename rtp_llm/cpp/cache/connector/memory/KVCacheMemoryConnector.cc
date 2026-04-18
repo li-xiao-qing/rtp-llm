@@ -166,10 +166,11 @@ std::shared_ptr<AsyncMatchContext> KVCacheMemoryConnector::asyncMatch(const std:
         reportMatchMetrics(/*success=*/false, timer.done_us(), cache_keys_size, matched_num);
         return nullptr;
     }
-    RTP_LLM_LOG_INFO("memory cache matched blocks: already_reuse=%zu matched=%zu cache_keys=%zu",
+    RTP_LLM_LOG_INFO("memory cache matched blocks: already_reuse=%zu matched=%zu cache_keys=%zu trace_id=%s",
                      already_reuse_num,
                      matched_num,
-                     cache_keys_size);
+                     cache_keys_size,
+                     meta ? meta->trace_id().c_str() : "N/A");
     reportMatchMetrics(/*success=*/true, timer.done_us(), cache_keys_size, matched_num);
     return std::make_shared<MemoryAsyncMatchContext>(matched_num);
 }
@@ -191,6 +192,8 @@ std::shared_ptr<AsyncContext> KVCacheMemoryConnector::asyncRead(const std::share
                                                                 int read_block_num) {
     RTP_LLM_PROFILE_FUNCTION();
     RTP_LLM_CHECK_WITH_INFO(resource != nullptr, "async read failed, resource is null");
+    RTP_LLM_LOG_INFO("[asyncRead] BEGIN trace_id=%s start=%d num=%d",
+                     meta ? meta->trace_id().c_str() : "N/A", start_read_block_index, read_block_num);
     const auto& cache_keys      = resource->cacheKeys();
     const auto  cache_keys_size = cache_keys.empty() ? 0 : cache_keys.size() - 1;
     if (cache_keys_size == 0) {
@@ -221,6 +224,9 @@ std::shared_ptr<AsyncContext> KVCacheMemoryConnector::asyncRead(const std::share
     if (!copy_plan || copy_plan->copy_infos.empty()) {
         reportReadMetrics(false, timer.done_us(), cache_keys_size, 0);
         return nullptr;
+    }
+    if (meta) {
+        copy_plan->trace_id = meta->trace_id();
     }
 
     const auto total_block_num = cache_keys_size;
@@ -343,6 +349,9 @@ std::shared_ptr<AsyncContext> KVCacheMemoryConnector::asyncWrite(const std::shar
     if (!copy_plan || copy_plan->copy_infos.empty()) {
         reportWriteMetrics(no_need_write, timer.done_us(), static_cast<int64_t>(cache_keys_size), 0);
         return nullptr;
+    }
+    if (meta) {
+        copy_plan->trace_id = meta->trace_id();
     }
 
     auto write_done =
@@ -467,9 +476,13 @@ bool KVCacheMemoryConnector::startCopyAsync(const std::shared_ptr<MemoryAsyncCon
         return false;
     }
     auto code = wait_done_thread_pool_->pushTask([this, context, copy_plan]() mutable {
+        RTP_LLM_LOG_INFO("[startCopyAsync] sendCopyPlan BEGIN trace_id=%s", copy_plan->trace_id.c_str());
         auto send_result = sendCopyPlan(copy_plan);
         context->setBroadcastResult(send_result);
+        RTP_LLM_LOG_INFO("[startCopyAsync] waitDone BEGIN trace_id=%s", copy_plan->trace_id.c_str());
         context->waitDone();
+        RTP_LLM_LOG_INFO("[startCopyAsync] waitDone END trace_id=%s success=%d",
+                         copy_plan->trace_id.c_str(), context->success());
     });
     if (code != autil::ThreadPoolBase::ERROR_NONE) {
         RTP_LLM_LOG_WARNING("start copy plan async failed, push send+wait task failed, code=%d", code);
@@ -483,6 +496,7 @@ KVCacheMemoryConnector::sendCopyPlan(const std::shared_ptr<CopyPlan>& copy_plan)
     MemoryOperationRequestPB mem_req;
     mem_req.set_copy_direction(copy_plan->direction == CopyDirection::H2D ? MemoryOperationRequestPB::H2D :
                                                                             MemoryOperationRequestPB::D2H);
+    mem_req.set_trace_id(copy_plan->trace_id);
     for (const auto& copy_info : copy_plan->copy_infos) {
         auto* item = mem_req.add_copy_items();
         item->set_mem_block(copy_info.mem_block);
@@ -490,6 +504,13 @@ KVCacheMemoryConnector::sendCopyPlan(const std::shared_ptr<CopyPlan>& copy_plan)
             item->add_gpu_blocks(block);
         }
     }
+
+    RTP_LLM_LOG_INFO("[sendCopyPlan] trace_id=%s direction=%s copy_items=%d workers=%zu timeout_ms=%d",
+                     copy_plan->trace_id.c_str(),
+                     copy_plan->direction == CopyDirection::H2D ? "H2D" : "D2H",
+                     mem_req.copy_items_size(),
+                     broadcast_manager_->workerNum(),
+                     kv_cache_config_.memory_cache_sync_timeout_ms);
 
     std::vector<FunctionRequestPB> requests;
     requests.reserve(broadcast_manager_->workerNum());
@@ -530,6 +551,11 @@ bool KVCacheMemoryConnector::copyCache(const MemoryOperationRequestPB& request, 
     autil::ScopedTime2 timer;
     const auto         copy_direction =
         (request.copy_direction() == MemoryOperationRequestPB::H2D) ? CopyDirection::H2D : CopyDirection::D2H;
+    const auto& trace_id = request.trace_id();
+    RTP_LLM_LOG_INFO("[copyCache] BEGIN trace_id=%s direction=%s copy_items=%d",
+                     trace_id.c_str(),
+                     copy_direction == CopyDirection::H2D ? "H2D" : "D2H",
+                     request.copy_items_size());
 
     std::vector<torch::Tensor> dst_buffers;
     std::vector<torch::Tensor> src_buffers;
@@ -554,6 +580,10 @@ bool KVCacheMemoryConnector::copyCache(const MemoryOperationRequestPB& request, 
         execNoBlockCopy(mc);
     }
 
+    RTP_LLM_LOG_INFO("[copyCache] END trace_id=%s direction=%s took_us=%ld",
+                     trace_id.c_str(),
+                     copy_direction == CopyDirection::H2D ? "H2D" : "D2H",
+                     timer.done_us());
     response.set_success(true);
     reportCopyMetrics(true, timer.done_us(), copy_direction);
     return true;

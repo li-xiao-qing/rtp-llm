@@ -95,11 +95,13 @@ public:
                                  ctx->server_addr.c_str());
                 }
                 if (!status.ok()) {
-                    RTP_LLM_LOG_WARNING("broadcast rpc failed, rank=%d err=%d(%s) addr=%s",
+                    RTP_LLM_LOG_WARNING("broadcast rpc failed, rank=%d err=%d(%s) addr=%s finished=%d/%d",
                                         rank,
                                         status.error_code(),
                                         status.error_message().c_str(),
-                                        ctx->server_addr.c_str());
+                                        ctx->server_addr.c_str(),
+                                        finished_count_.load(),
+                                        worker_size);
                     grpc_status_failure_seen_ = true;
                 }
             }

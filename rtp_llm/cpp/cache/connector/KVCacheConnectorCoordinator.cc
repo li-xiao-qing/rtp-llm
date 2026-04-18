@@ -206,11 +206,14 @@ void KVCacheConnectorCoordinator::processReadContexts() {
     for (auto it = fused_async_read_context_list_.begin(); it != fused_async_read_context_list_.end();) {
         auto fused_read_context = *it;
         if (fused_read_context->done()) {
+            const auto& meta = fused_read_context->meta();
+            RTP_LLM_LOG_INFO("[processReadContexts] notifyDone trace_id=%s success=%d",
+                             meta ? meta->trace_id().c_str() : "N/A",
+                             fused_read_context->success());
             fused_read_context->notifyDone();
             it = fused_async_read_context_list_.erase(it);
             continue;
         }
-        // 没有 done 但是有 read context, 或者 match context 还没 done, 或者 match 失败 (下一轮调度处理), 继续等待
         auto read_context  = fused_read_context->fusedReadContext();
         auto match_context = fused_read_context->fusedMatchContext();
         if (read_context || !match_context->done() || !match_context->success()) {
@@ -218,6 +221,9 @@ void KVCacheConnectorCoordinator::processReadContexts() {
             continue;
         }
         // match success, start read
+        const auto& meta = fused_read_context->meta();
+        RTP_LLM_LOG_INFO("[processReadContexts] asyncReadAfterMatch trace_id=%s",
+                         meta ? meta->trace_id().c_str() : "N/A");
         asyncReadAfterMatch(fused_read_context);
         it = std::next(it);
     }
@@ -245,6 +251,9 @@ void KVCacheConnectorCoordinator::asyncReadAfterMatch(std::shared_ptr<FusedAsync
         match_contexts.size(),
         connectors_.size());
 
+    const auto& meta = fused_read_context->meta();
+    const auto  trace_id = meta ? meta->trace_id() : std::string("N/A");
+
     int                                        already_reuse_num = fused_read_context->resource()->reuseBlockNum();
     std::vector<std::shared_ptr<AsyncContext>> connector_read_contexts;
     for (int i = 0; i < match_contexts.size(); i++) {
@@ -256,6 +265,8 @@ void KVCacheConnectorCoordinator::asyncReadAfterMatch(std::shared_ptr<FusedAsync
         if (matched_num <= already_reuse_num) {
             continue;
         }
+        RTP_LLM_LOG_INFO("[asyncReadAfterMatch] trace_id=%s connector=%d matched=%d already_reuse=%d read_num=%d",
+                         trace_id.c_str(), i, matched_num, already_reuse_num, matched_num - already_reuse_num);
         auto connector_read_context = connectors_.at(i)->asyncRead(fused_read_context->resource(),
                                                                    fused_read_context->meta(),
                                                                    match_context,

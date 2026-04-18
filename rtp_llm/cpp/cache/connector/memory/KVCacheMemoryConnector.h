@@ -70,6 +70,7 @@ private:
     struct CopyPlan {
         std::vector<CopyInfoPerKey> copy_infos;
         CopyDirection               direction;
+        std::string                 trace_id;
     };
 
     std::shared_ptr<CopyPlan> buildCopyPlanForRead(const CacheKeysType& cache_keys,
