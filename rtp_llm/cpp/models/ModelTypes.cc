@@ -1,8 +1,56 @@
 #include "rtp_llm/cpp/models/ModelTypes.h"
 #include "rtp_llm/cpp/core/torch_utils/TypeConvert.h"
 #include "rtp_llm/cpp/core/ExecOps.h"
+#include "rtp_llm/cpp/utils/Logger.h"
+#if USING_CUDA
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+#include "rtp_llm/cpp/cuda/cuda_host_utils.h"
+#endif
 
 namespace rtp_llm {
+
+namespace {
+
+// Synchronize all CUDA streams used in this function instead of calling
+// cudaDeviceSynchronize().
+//
+// cudaDeviceSynchronize() acquires a device-wide context lock that blocks
+// *all* CUDA API calls (including cudaMemcpyAsync) from other CPU threads on
+// the same device.  This causes a deadlock when:
+//   - Rank 1-7 engine threads call cudaDeviceSynchronize() here, waiting for
+//     an NCCL broadcast that requires Rank 0 to participate;
+//   - Rank 0 is blocked in loadCacheSync() waiting for gRPC copyCache
+//     responses from Rank 1-7;
+//   - Rank 1-7 gRPC threads try to call cudaMemcpyAsync (NoBlockCopy) but are
+//     blocked by the context lock held by cudaDeviceSynchronize().
+//
+// By synchronizing only specific streams we avoid blocking other threads.
+void syncAllStreams() {
+#if USING_CUDA
+    int device = -1;
+    check_cuda_value(cudaGetDevice(&device));
+
+    // Sync the CUDA default stream (stream 0 / legacy default).
+    // Operations submitted via bare CUDA runtime calls go here.
+    check_cuda_value(cudaStreamSynchronize(nullptr));
+
+    // Sync the PyTorch current stream for this device.
+    // c10dBroadcast's work->wait() inserts an event dependency from the NCCL
+    // internal stream onto this stream, so synchronizing it also waits for
+    // NCCL to finish.  The D2H buffer.copy_() also runs on this stream.
+    auto current = at::cuda::getCurrentCUDAStream(device);
+    if (current.stream() != nullptr) {
+        check_cuda_value(cudaStreamSynchronize(current.stream()));
+    }
+
+    check_cuda_error();
+#else
+    cudaSyncAndCheck();
+#endif
+}
+
+}  // namespace
 
 void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallelism_config) {
     if (parallelism_config.tp_size <= 1) {
@@ -61,7 +109,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
     shape_hints_ptr[GptModelInputIndex::isFakeStream] = inputs.is_fake_stream;
     execBroadcast({{shape_hints_t}, 0});
     execSyncCommunication(false);
-    cudaSyncAndCheck();
+    syncAllStreams();
 
     // multimodal features shape broadcast
     torch::Tensor mm_features_shape_t;
@@ -82,7 +130,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
         }
         execBroadcast({{mm_features_shape_t}, 0});
         execSyncCommunication(false);
-        cudaSyncAndCheck();
+        syncAllStreams();
     }
 
     auto   max_kernel_blocks       = (size_t)shape_hints_ptr[GptModelInputIndex::maxKernelBlocksPerBatch];
@@ -296,7 +344,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
         packed_buffers.push_back(gpu_packed);
     }
     execBroadcast({packed_buffers, 0});
-    cudaSyncAndCheck();
+    syncAllStreams();
 
     // Unpack from packed buffers back to each tensor's original storage.
     if (!is_root) {

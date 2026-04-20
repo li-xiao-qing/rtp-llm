@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/core/DistributedComm.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 
+#include <chrono>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #if USING_CUDA
 #include <c10/cuda/CUDAGuard.h>
@@ -114,16 +115,39 @@ void c10dBroadcast(const BroadcastParams& params) {
     }
 
     DeviceGuard guard(entry.device_id);
-    for (auto& buffer : params.buffers) {
+    for (size_t buf_idx = 0; buf_idx < params.buffers.size(); ++buf_idx) {
+        auto& buffer = params.buffers[buf_idx];
         bool                    on_cpu  = !buffer.is_cuda();
         at::Tensor              gpu_buf = on_cpu ? buffer.to(at::Device(at::kCUDA, entry.device_id), true) : buffer;
         std::vector<at::Tensor> tensors = {gpu_buf};
         c10d::BroadcastOptions  opts;
         opts.rootRank = params.root;
+
+        RTP_LLM_LOG_DEBUG("[c10dBroadcast] buf[%zu] pre-broadcast: on_cpu=%d, numel=%lld, device=%d, root=%d",
+                          buf_idx, (int)on_cpu, (long long)buffer.numel(), (int)entry.device_id, params.root);
+
         auto work     = entry.pg->broadcast(tensors, opts);
+
+        auto t0 = std::chrono::steady_clock::now();
         work->wait();
+        auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+
+        if (wait_ms > 5000) {
+            RTP_LLM_LOG_WARNING("[c10dBroadcast] buf[%zu] work->wait() took %lld ms (device=%d)",
+                                buf_idx, (long long)wait_ms, (int)entry.device_id);
+        }
+
         if (on_cpu) {
+            auto t1 = std::chrono::steady_clock::now();
+            RTP_LLM_LOG_DEBUG("[c10dBroadcast] buf[%zu] pre-copy_ D2H: numel=%lld", buf_idx, (long long)buffer.numel());
             buffer.copy_(tensors[0]);
+            auto copy_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t1).count();
+            if (copy_ms > 5000) {
+                RTP_LLM_LOG_WARNING("[c10dBroadcast] buf[%zu] buffer.copy_() D2H took %lld ms (device=%d)",
+                                    buf_idx, (long long)copy_ms, (int)entry.device_id);
+            }
         }
     }
 }

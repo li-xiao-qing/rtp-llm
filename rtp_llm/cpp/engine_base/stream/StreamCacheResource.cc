@@ -340,12 +340,17 @@ void StreamCacheResource::loadCacheSync() {
     assert(reuse_cache());
     auto meta               = std::make_shared<MetaImpl>(enableMemoryCache(), enableRemoteCache(), stream_->traceId());
     auto connector_context  = std::make_shared<KVCacheConnectorReadWriteContextImpl>(batch_kv_cache_resource_, meta);
+    RTP_LLM_LOG_INFO("[loadCacheSync] BEGIN stream_id=%ld trace_id=%s",
+                     stream_->streamId(), stream_->traceId().c_str());
     std::shared_ptr<AsyncContext> load_cache_context;
     {
         RTP_LLM_PROFILE_SCOPE("asyncLoadCache");
         load_cache_context = resource_context_.cache_manager->asyncLoadCache(connector_context);
     }
     waitLoadCacheDone(load_cache_context);
+    RTP_LLM_LOG_INFO("[loadCacheSync] END stream_id=%ld trace_id=%s success=%d",
+                     stream_->streamId(), stream_->traceId().c_str(),
+                     load_cache_context ? load_cache_context->success() : -1);
 }
 
 void StreamCacheResource::waitLoadCacheDone(const std::shared_ptr<AsyncContext>& load_context) {

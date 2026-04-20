@@ -1,4 +1,6 @@
 #include "rtp_llm/cpp/cache/connector/memory/MemoryAsyncContext.h"
+#include "rtp_llm/cpp/utils/Logger.h"
+#include <chrono>
 
 namespace rtp_llm {
 
@@ -44,7 +46,17 @@ void MemoryAsyncContext::waitDone() {
         return;
     }
     if (broadcast_result_) {
-        broadcast_result_->waitDone();
+        auto t0 = std::chrono::steady_clock::now();
+        int  warn_count = 0;
+        while (!broadcast_result_->done()) {
+            if (!broadcast_result_->waitDone(10000)) {
+                ++warn_count;
+                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count();
+                RTP_LLM_LOG_WARNING("[MemoryAsyncContext::waitDone] broadcast STILL WAITING elapsed=%lld ms",
+                                    (long long)elapsed_ms);
+            }
+        }
     }
     if (done_callback_) {
         done_callback_(success());

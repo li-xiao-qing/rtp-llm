@@ -484,28 +484,37 @@ void LocalRpcServer::reportCacheStatusTime(int64_t request_begin_time_us) {
 ::grpc::Status LocalRpcServer::ExecuteFunction(::grpc::ServerContext*     context,
                                                const ::FunctionRequestPB* request,
                                                ::FunctionResponsePB*      response) {
-    RTP_LLM_LOG_DEBUG("receive execute function request from client: %s, request: [%s]",
-                      context->peer().c_str(),
-                      request->DebugString().c_str());
+    std::string trace_id;
+    if (request->has_mem_request()) {
+        trace_id = request->mem_request().trace_id();
+    }
+    RTP_LLM_LOG_INFO("[ExecuteFunction] BEGIN peer=%s trace_id=%s has_mem=%d has_remote=%d has_p2p=%d",
+                     context->peer().c_str(), trace_id.c_str(),
+                     request->has_mem_request(), request->has_remote_request(), request->has_p2p_request());
+    auto t0 = std::chrono::steady_clock::now();
+
     if (context->IsCancelled()) {
-        RTP_LLM_LOG_WARNING("execute function failed, request is cancelled");
+        RTP_LLM_LOG_WARNING("[ExecuteFunction] CANCELLED trace_id=%s", trace_id.c_str());
         return grpc::Status(grpc::StatusCode::CANCELLED, "request is cancelled");
     }
     if (!engine_) {
-        RTP_LLM_LOG_WARNING("execute function failed, engine is null");
+        RTP_LLM_LOG_WARNING("[ExecuteFunction] engine is null trace_id=%s", trace_id.c_str());
         return grpc::Status(grpc::StatusCode::INTERNAL, "engine is null");
     }
 
     auto cache_manager = engine_->getCacheManager();
     if (!cache_manager) {
-        RTP_LLM_LOG_WARNING("execute function failed, cache manager is null");
+        RTP_LLM_LOG_WARNING("[ExecuteFunction] cache manager is null trace_id=%s", trace_id.c_str());
         return grpc::Status(grpc::StatusCode::INTERNAL, "cache manager is null");
     }
     if (!cache_manager->executeFunction(*request, *response)) {
-        RTP_LLM_LOG_WARNING("execute function failed, request: [%s]", request->DebugString().c_str());
-        const std::string error_msg = "execute function failed, request: [" + request->DebugString() + "]";
+        RTP_LLM_LOG_WARNING("[ExecuteFunction] FAILED trace_id=%s", trace_id.c_str());
+        const std::string error_msg = "execute function failed, trace_id: " + trace_id;
         return grpc::Status(grpc::StatusCode::INTERNAL, error_msg);
     }
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    RTP_LLM_LOG_INFO("[ExecuteFunction] END trace_id=%s took %lld ms", trace_id.c_str(), (long long)elapsed_ms);
     return grpc::Status::OK;
 }
 

@@ -122,11 +122,19 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         RTP_LLM_PROFILE_SCOPE("executor.tp_sync_input");
         int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
         model_input.skip_run  = streams.empty() && !enable_ffn_disaggregate_;
+        RTP_LLM_LOG_DEBUG("[executor] tpSync BEGIN rank=%d skip_run=%d streams=%zu",
+                         parallelism_config_.tp_rank, (int)model_input.skip_run, streams.size());
         tpSyncModelInputs(model_input, parallelism_config_);
+        auto sync_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+        if (sync_us > 5000000) {
+            RTP_LLM_LOG_WARNING("[executor] tpSync SLOW rank=%d took %ld us skip_run=%d",
+                                parallelism_config_.tp_rank, sync_us, (int)model_input.skip_run);
+        }
         if (model_input.skip_run) {
+            RTP_LLM_LOG_DEBUG("[executor] tpSync skip_run=true, returning");
             return absl::OkStatus();
         }
-        executor_collector.tp_sync_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+        executor_collector.tp_sync_input_us = sync_us;
     }
 
     // make sure last model input is released before forward
